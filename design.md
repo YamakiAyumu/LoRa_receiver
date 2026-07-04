@@ -111,6 +111,15 @@ int handle_tx(uint8_t payload[]);
  * @return {int} 取得した文字列の長さ
  */
 int handle_rx(char *buffer, size_t buffer_size, uint32_t timeout_ms);
+
+/*
+以下追加する関数
+・センサ読んでペイロードに格納
+・Bluetooth接続
+・ペイロード渡してBluetooth通知
+・Wi-Fi接続
+・HTTP POSTでペイロード投げる
+*/
 ```
 </div></details>
 
