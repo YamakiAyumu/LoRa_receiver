@@ -13,7 +13,10 @@
 <details><summary>定数/変数</summary><div>
 
 ```C
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
 
+static const uint16_t groups[];
 ```
 </div></details>
 
@@ -35,9 +38,6 @@
 <details><summary>定数/変数</summary><div>
 
 ```C
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
-
 enum SensorDataType {
     INT,
     FLOAT,
@@ -62,13 +62,10 @@ struct Packet {
     const uint8_t header[2] = {'T', 'G'};
     uint8_t length;
     uint16_t gid;
-    uint16_t lid;
+    uint16_t lmid;
     uint8_t payload[128];
     uint8_t checksum;
 };
-
-static const uint16_t groups[];
-static const uint16_t children[];
 ```
 </div></details>
 
@@ -76,10 +73,27 @@ static const uint16_t children[];
 
 ```C
 /**
- * システム全体（各モジュール/モジュール間の通信）を初期化する関数
+ * 制御モジュール（ESP32/Raspberry Pi Pico）を初期化する関数
+ * @param {void} *serial_instance シリアルオブジェクトのポインタ
+ * @param {int} uart_tx_pin UARTの送信ピン
+ * @param {int} uart_rx_pin UARTの受信ピン
  * @return {int} 処理結果（0: 成功、-1: エラー）
  */
-int init_comm_system();
+int init_serial(void *serial_instance, const int uart_tx_pin, const int uart_rx_pin);
+
+int init_controller();
+
+/**
+ * LoRaモジュールを初期化する関数
+ * @return {int} 処理結果（0: 成功、-1: エラー）
+ */
+int init_lora_module();
+
+/**
+ * 通信の同期を行う関数
+ * @param {uint16_t} gid 所属グループのID
+ */
+int prepare_comm(uint16_t gid);
 
 /**
  * payloadから任意の要素を取得する関数
@@ -97,11 +111,23 @@ int get_payload_char(int index, char *output);
 int get_payload(char *output);
 
 /**
- * 送信処理（データのフォーマット・送信）を行う関数
+ * 送信処理（パケットの作成・送信）を行う関数
+ * @param {uint16_t} gid 所属グループID
+ * @param {uint16_t} lmid 送信元ID
+ * @param {uint16_t} dst 送信先ID
  * @param {uint8_t} payload[] 送信する文字列
+ * @param {size_t} paylaod_len 送信文字列の長さ
  * @return {int} 処理結果（0: 成功、-1: エラー）
  */
-int handle_tx(uint8_t payload[]);
+int handle_tx_raw(uint16_t dst, uint16_t gid, uint16_t lmid, const uint8_t payload[], size_t payload_len);
+
+/**
+ * センサデータをフォーマットしてhandle_tx_rawに渡す関数
+ * @param {SensorData} sensors[] センサデータのリスト
+ * @param {size_t} sensor_count センサの種類
+ * @return {int} 処理結果（0: 成功、-1: エラー）
+ */
+int handle_tx_sensor(uint16_t dst, const SensorData sensors[], size_t sensor_count);
 
 /**
  * 受信処理（データの受信・検証）を行う関数
@@ -112,32 +138,23 @@ int handle_tx(uint8_t payload[]);
  */
 int handle_rx(char *buffer, size_t buffer_size, uint32_t timeout_ms);
 
-/*
-以下追加する関数
-・センサ読んでペイロードに格納
-・Bluetooth接続
-・ペイロード渡してBluetooth通知
-・Wi-Fi接続
-・HTTP POSTでペイロード投げる
-*/
+/**
+ * 受信データをキューに入れる関数
+ * @param {char} *buffer 検証済み受信データ
+ * @return {int} 処理結果（0: 成功、-1: エラー）
+ */
+int enqueue_packet(char *buffer);
+
+/**
+ * センサデータを取得してペイロードを作成する関数
+ */
+int sense();
 ```
 </div></details>
 
 <details><summary>内部関数</summary><div>
 
 ```C
-/**
- * 制御用モジュール（ESP32/Raspberry Pi Pico）を初期化する関数
- * @return {int} 処理結果（0: 成功、-1: エラー）
- */
-int init_controller();
-
-/**
- * LoRaモジュールとのシリアル通信を初期化する関数
- * @return {int} 処理結果（0: 成功、-1: エラー）
- */
-int init_lora_serial();
-
 /**
  * 送信パケットを作成する関数
  * @param {Packet} *packet 送信パケットへのポインタ
@@ -150,11 +167,11 @@ int build_packet(Packet *packet, uint8_t payload[]);
  * 16進数文字列をデコードして配列に格納する関数
  * @param {char} *input 入力文字列へのポインタ
  * @param {size_t} input_len 入力文字列の長さ
- * @param {uint8_t} *output デコード後の値を格納する変数へのポインタ
+ * @param {char} *output デコード後の値を格納する変数へのポインタ
  * @param {size_t} output_size デコード後の値の長さ
  * @return {int} 処理結果（0: 成功、-1: エラー）
  */
-int hex_decode(const char *input, size_t input_len, uint8_t *output, size_t output_size);
+int hex_decode(const char *input, size_t input_len, char *output, size_t output_size);
 
 /**
  * 受信したデータを検証する関数
@@ -192,11 +209,24 @@ static size_t packet_length;
 
 ```C
 /**
- * LoRaモジュールを初期化する関数
- * @param {void} *serial_instance シリアルオブジェクトのポインタ
+ * 制御用モジュールを初期化する関数
  * @return {void}
  */
-void init_lora_module(void *serial_instance);
+void config_controller();
+
+/**
+ * LoRaモジュールを初期化する関数
+ * @param {uint16_t} gid 所属グループのID
+ * @param {uint16_t} own LoRaモジュールのID
+ * @return {void}
+ */
+void config_lora_module(uint16_t gid, uint16_t own);
+
+/**
+ * シリアル通信を初期化する関数
+ * @return {void}
+ */
+void config_serial(void *comm_port, const int uart_tx_pin, const int uart_rx_pin);
 
 /**
  * 送信先を設定する関数
@@ -249,18 +279,17 @@ void set_tx_byte(uint8_t data);
 void set_tx_word(uint16_t data);
 
 /**
- * packet_lengthを書き込んでパケットを送信する関数
+ * パケットを送信する関数
  * @return {void}
  */
 void send_packet();
 
 /**
  * データを受信する関数
- * @param {uint8_t} buffer[] 受信バッファへのポインタ
  * @param {uint32_t} timeout_ms 受信タイムアウトまでの時間（ms）
- * @return {int} 受信した文字列の長さ
+ * @return {void}
  */
-int recv_packet(char buffer[], uint32_t timeout_ms);
+void recv_packet(uint32_t timeout_ms);
 
 /**
  * プリアンブルを送信する関数

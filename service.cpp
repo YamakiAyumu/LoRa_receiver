@@ -1,72 +1,141 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "pico/cyw43_arch.h"
-#include "lora.h"
+#include "hardware/uart.h"
+#include "hardware/gpio.h"
+#include "service.h"
+#include "module.h"
 
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
+#define RX_BUFFER_SIZE 128
 
-static const uint16_t groups[] = {0, 1}; // 仮置きのグループIDリスト
-static const uint16_t children[] = {1, 2, 3, 4}; // 仮置きの子機IDリスト
+static Packet rx_queue[RX_BUFFER_SIZE];
+static int rx_queue_head = 0;
+static int rx_queue_tail = 0;
+static int rx_queue_count = 0;
+static uart_inst_t* uart_id;
+uint16_t current_received_from;
 
-void initialize_raspi();
-bool all_children_collected();
-int validate_packet(const char *input, size_t input_len);
-int make_packet(Packet *packet, const char *payload, size_t payload_len);
-uint8_t calc_checksum(Packet *packet);
+static int hex_decode(const char *input, size_t input_len, char *output, size_t output_size);
+static int validate_packet(const char *input, size_t input_len);
+static int calc_checksum(Packet *packet);
 
+int init_controller() {
+    config_controller();
 
-int main() {
-    initialize_raspi();
-    lora_serial_begin();
-    initialize_lora_module();
-    int index = 0;
-    while (true) {
-        send_preamble();
-        sleep_ms(1200);
+    return 0;
+}
 
-        // ブロードキャストで自身のIDを送信
-        if (index >= sizeof(groups)) {
-            index = 0;
-        }
-        set_gid(groups[index++]);
-        set_dst(0xFFFF);
-        Packet tx_packet;
-        make_packet(&tx_packet, "", 0);
-        set_packet(&tx_packet);
-        send_packet();
+int init_lora_module(uint16_t gid, uint16_t lid) {
+    config_lora_module(gid, lid);
 
-        char buffer[128];
-        int received_size = receive_serial_until_timeout(buffer, sizeof(buffer), 10000);
-        if (received_size < 0) {
-            continue;
-        }
+    return 0;
+}
 
-        if (validate_packet(buffer, received_size) < 0) {
-            continue;
-        }
+int init_serial(void *comm_port, const int uart_tx_pin, const int uart_rx_pin) {
+    config_serial(comm_port, uart_tx_pin, uart_rx_pin);
 
-        set_dst_with_endian(buffer[3], buffer[4]);
+    return 0;
+}
 
-        Packet ack_packet;
-        make_packet(&ack_packet, "\x06", 1);
-        set_packet(&ack_packet);
-        send_packet();
-        
-        // サーバへのデータ送信
-        // Android端末へのデータ送信
+int change_group(uint16_t gid) {
+    set_gid(gid);
+
+    return 0;
+}
+
+int prepare_comm() {
+    send_preamble(1200);
+    sleep_ms(1200);
+
+    return 0;
+}
+
+int handle_tx_raw(uint16_t dst, uint16_t gid, uint16_t lid, const uint8_t payload[], size_t payload_len) {
+    if (dst == 0) {
+        set_dst(current_received_from);
+    } else {
+        set_dst(dst);
     }
+
+    Packet packet;
+    packet.length = payload_len;
+    packet.gid = gid;
+    packet.lmid = lid;
+    for (size_t i = 0; i < payload_len; i++) {
+        packet.payload[i] = payload[i];
+    }
+    packet.checksum = calc_checksum(&packet);
+
+    open_tx_buffer();
+    set_tx_byte(packet.length + 6);
+    set_tx_byte(packet.header[0]);
+    set_tx_byte(packet.header[1]);
+    set_tx_word(packet.gid);
+    set_tx_word(packet.lmid);
+    for (size_t i = 0; i < payload_len; i++) {
+        set_tx_byte(packet.payload[i]);
+    }
+    set_tx_byte(packet.checksum);
+    send_packet();
+
+    return 0;
 }
 
-void initialize_raspi() {
-    stdio_init_all();
+int handle_rx(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
+    char raw_buffer[256];
+    int raw_buffer_len = recv_packet(raw_buffer, sizeof(raw_buffer), timeout_ms);
+    if (raw_buffer_len < 0) {
+        return -1;
+    }
 
-    sleep_ms(1000);
-    printf("UART initialized");
+    int decoded_len = hex_decode(raw_buffer, raw_buffer_len, buffer, buffer_size);
+    if (decoded_len < 0) {
+        return -1;
+    }
+
+    if (validate_packet(buffer, decoded_len) < 0) {
+        return -1;
+    }
+
+    return decoded_len;
 }
 
-int validate_packet(const char *input, size_t input_len) {
-    if (input_len < 5) {
+int enqueue_packet(char *buffer) {
+    if (rx_queue_count >= RX_BUFFER_SIZE) {
+        printf("enqueue_packet: queue is full\n");
+        return -1;
+    }
+
+    Packet *packet = &rx_queue[rx_queue_tail];
+    packet->length = buffer[2];
+    packet->gid = (uint16_t)((uint8_t)buffer[3] | ((uint8_t)buffer[4] << 8));
+    packet->lmid = (uint16_t)((uint8_t)buffer[5] | ((uint8_t)buffer[6] << 8));
+    for (size_t i = 0; i < packet->length; i++) {
+        packet->payload[i] = (uint8_t)buffer[7 + i];
+    }
+    packet->checksum = (uint8_t)buffer[7 + packet->length];
+
+    rx_queue_tail = (rx_queue_tail + 1) % RX_BUFFER_SIZE;
+    rx_queue_count++;
+
+    return 0;
+}
+
+static int hex_decode(const char *input, size_t input_len, char *output, size_t output_size) {
+    int required_size = input_len / 2;
+    for (int i = 0; i < required_size; i++) {
+        unsigned int value;
+        if (sscanf(&input[i * 2], "%2x", &value) != 1) {
+            printf("hex_decode: parse failed at index=%d\n", i);
+            return -1;
+        }
+        output[i] = (char)value;
+    }
+
+    return required_size;
+}
+
+static int validate_packet(const char *input, size_t input_len) {
+    if (input_len < 8) {
         printf("validate_packet: too short input\n");
         return -1;
     }
@@ -76,12 +145,12 @@ int validate_packet(const char *input, size_t input_len) {
         return -1;
     }
 
-    if (input[2] != input_len - 3) {
-        printf("validate_packet: length mismatch (declared=%u expected=%zu)\n", (unsigned)input[2], input_len - 3);
+    if (input[2] != input_len - 8) {
+        printf("validate_packet: length mismatch (declared=%u expected=%zu)\n", (unsigned)input[2], input_len - 8);
         return -1;
     }
 
-    int checksum = 0;
+    uint8_t checksum = 0;
     for (size_t i = 0; i < input_len - 1; i++) {
         checksum += (unsigned char)input[i];
     }
@@ -94,32 +163,18 @@ int validate_packet(const char *input, size_t input_len) {
     return 0;
 }
 
-int make_packet(Packet *packet, const char *payload, size_t payload_len) {
-    if (packet == nullptr) {
-        printf("make_packet: packet is null\n");
-        return -1;
-    }
-
-    packet->length = payload_len;
-    packet->lmid = 0; // 仮置き
-    for (size_t i = 0; i < payload_len; i++) {
-        packet->payload[i] = (uint8_t)payload[i];
-    }
-    packet->checksum = calc_checksum(packet);
-
-    printf("make_packet: created packet with length=%u, lmid=%u, checksum=0x%02X\n", (unsigned)packet->length, (unsigned)packet->lmid, (unsigned)packet->checksum);
-    return 0;
-}
-
-uint8_t calc_checksum(Packet *packet) {
+static int calc_checksum(Packet *packet) {
     uint8_t checksum = 0;
     checksum += packet->header[0];
     checksum += packet->header[1];
     checksum += packet->length;
+    checksum += (packet->gid & 0xFF);
+    checksum += ((packet->gid >> 8) & 0xFF);
     checksum += (packet->lmid & 0xFF);
     checksum += ((packet->lmid >> 8) & 0xFF);
     for (size_t i = 0; i < packet->length; i++) {
         checksum += packet->payload[i];
     }
+
     return checksum;
 }
